@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use std::future::Future;
 
 #[derive(Clone)]
 pub(crate) struct ControlApiState {
@@ -36,27 +37,41 @@ async fn switch_model(
     State(state): State<ControlApiState>,
     Json(selection): Json<ModelSelection>,
 ) -> Response<Body> {
-    action_response(
-        state.switcher.control_switch(&selection.model).await,
-        state.switcher.controller_status().await,
-    )
+    // Lifecycle hooks can take many minutes. Run the operation independently
+    // of the HTTP request so a browser disconnect or facade restart cannot
+    // cancel it halfway through and strand the switcher in `switching`.
+    let status_switcher = state.switcher.clone();
+    let action_switcher = state.switcher;
+    let model = selection.model;
+    let result = detached_action(async move { action_switcher.control_switch(&model).await }).await;
+    action_response(result, status_switcher.controller_status().await)
 }
 
 async fn pin_model(
     State(state): State<ControlApiState>,
     Json(selection): Json<ModelSelection>,
 ) -> Response<Body> {
-    action_response(
-        state.switcher.pin_model(&selection.model).await,
-        state.switcher.controller_status().await,
-    )
+    let status_switcher = state.switcher.clone();
+    let action_switcher = state.switcher;
+    let model = selection.model;
+    let result = detached_action(async move { action_switcher.pin_model(&model).await }).await;
+    action_response(result, status_switcher.controller_status().await)
 }
 
 async fn unpin_model(State(state): State<ControlApiState>) -> Response<Body> {
-    action_response(
-        state.switcher.unpin_model().await,
-        state.switcher.controller_status().await,
-    )
+    let status_switcher = state.switcher.clone();
+    let action_switcher = state.switcher;
+    let result = detached_action(async move { action_switcher.unpin_model().await }).await;
+    action_response(result, status_switcher.controller_status().await)
+}
+
+async fn detached_action<F>(action: F) -> Result<(), crate::SwitchError>
+where
+    F: Future<Output = Result<(), crate::SwitchError>> + Send + 'static,
+{
+    tokio::spawn(action)
+        .await
+        .map_err(|error| crate::SwitchError::Internal(format!("control task failed: {error}")))?
 }
 
 fn action_response(

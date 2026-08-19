@@ -554,6 +554,33 @@ async fn control_auth_pin_switch_and_unpin() {
 }
 
 #[tokio::test]
+async fn cancelled_control_request_does_not_cancel_lifecycle() {
+    let hooks_a = MockHooks::new(250, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/control/v1/pin")
+        .header("Content-Type", "application/json")
+        .body(Body::from(json!({"model": "model-a"}).to_string()))
+        .unwrap();
+    let request_task = tokio::spawn(async move { app.oneshot(request).await });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    request_task.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let status = switcher.controller_status().await;
+    assert_eq!(status.state, "active");
+    assert_eq!(status.active_model.as_deref(), Some("model-a"));
+    assert_eq!(status.pinned_model.as_deref(), Some("model-a"));
+}
+
+#[tokio::test]
 async fn background_waits_for_interactive_lease_but_interactive_overrides() {
     let hooks_a = MockHooks::new(0, 0);
     let hooks_b = MockHooks::new(0, 0);
