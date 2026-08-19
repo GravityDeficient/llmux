@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Top-level configuration
@@ -24,6 +24,80 @@ pub struct Config {
     /// Proxy port
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Address to bind the HTTP server to.
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+
+    /// Authentication for inference and control traffic.
+    #[serde(default)]
+    pub auth: AuthConfig,
+
+    /// Request-aware orchestration settings.
+    #[serde(default)]
+    pub orchestration: OrchestrationConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Optional bearer token for inference routes. Use `env:NAME` to read it
+    /// from an environment variable when llmux starts.
+    #[serde(default)]
+    pub inference_bearer_token: Option<String>,
+
+    /// Optional, independent bearer token for `/control/v1/*`.
+    #[serde(default)]
+    pub control_bearer_token: Option<String>,
+}
+
+impl AuthConfig {
+    pub fn resolve_inference_token(&self) -> Result<Option<String>> {
+        resolve_token(
+            self.inference_bearer_token.as_deref(),
+            "inference_bearer_token",
+        )
+    }
+
+    pub fn resolve_control_token(&self) -> Result<Option<String>> {
+        resolve_token(self.control_bearer_token.as_deref(), "control_bearer_token")
+    }
+}
+
+fn resolve_token(value: Option<&str>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value else { return Ok(None) };
+    let resolved = if let Some(name) = value.strip_prefix("env:") {
+        std::env::var(name)
+            .with_context(|| format!("{field} references missing environment variable {name}"))?
+    } else {
+        value.to_string()
+    };
+    anyhow::ensure!(!resolved.is_empty(), "{field} must not be empty");
+    Ok(Some(resolved))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestrationConfig {
+    /// Rolling lease renewed when an interactive response finishes.
+    #[serde(default = "default_interactive_lease_secs")]
+    pub interactive_lease_secs: u64,
+
+    /// Maximum time an inactive background request waits.
+    #[serde(default = "default_background_max_wait_secs")]
+    pub background_max_wait_secs: u64,
+
+    /// Optional state file used to persist a model pin across restarts.
+    #[serde(default)]
+    pub state_path: Option<PathBuf>,
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            interactive_lease_secs: default_interactive_lease_secs(),
+            background_max_wait_secs: default_background_max_wait_secs(),
+            state_path: None,
+        }
+    }
 }
 
 /// Configuration for a single model.
@@ -66,10 +140,43 @@ pub struct ModelConfig {
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Exit 0 = healthy, non-zero = unhealthy.
     pub alive: String,
+
+    /// Optional operator-facing data returned by the control API. It does
+    /// not affect scheduling or hooks.
+    #[serde(default)]
+    pub metadata: ModelMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelMetadata {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub topology: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default)]
+    pub speculative_decoding: Option<String>,
+    #[serde(default)]
+    pub impact: Vec<String>,
 }
 
 fn default_port() -> u16 {
     3000
+}
+
+fn default_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_interactive_lease_secs() -> u64 {
+    600
+}
+
+fn default_background_max_wait_secs() -> u64 {
+    1800
 }
 
 impl Config {
@@ -204,8 +311,25 @@ port: 4000
 
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.port, 3000);
+        assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.policy.request_timeout_secs, None);
         assert!(config.policy.drain_before_switch);
         assert_eq!(config.policy.min_active_secs, 0);
+        assert_eq!(config.orchestration.interactive_lease_secs, 600);
+        assert_eq!(config.orchestration.background_max_wait_secs, 1800);
+    }
+
+    #[test]
+    fn test_auth_token_from_environment() {
+        unsafe { std::env::set_var("LLMUX_TEST_TOKEN", "secret") };
+        let auth = AuthConfig {
+            inference_bearer_token: Some("env:LLMUX_TEST_TOKEN".into()),
+            control_bearer_token: None,
+        };
+        assert_eq!(
+            auth.resolve_inference_token().unwrap().as_deref(),
+            Some("secret")
+        );
+        unsafe { std::env::remove_var("LLMUX_TEST_TOKEN") };
     }
 }

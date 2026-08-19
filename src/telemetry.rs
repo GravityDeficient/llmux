@@ -41,7 +41,7 @@ fn describe() {
     );
     describe_gauge!(
         "llmux_request_queue_depth",
-        "Number of requests waiting for a model to become active"
+        "Number of requests waiting, partitioned by model and priority"
     );
     describe_histogram!(
         "llmux_request_queue_wait_seconds",
@@ -50,6 +50,31 @@ fn describe() {
     describe_gauge!(
         "llmux_model_in_flight",
         "Current in-flight requests per model"
+    );
+    describe_gauge!(
+        "llmux_active_model_info",
+        "One for the active model, zero otherwise"
+    );
+    describe_gauge!("llmux_pin_info", "One for the pinned model, zero otherwise");
+    describe_gauge!(
+        "llmux_lease_remaining_seconds",
+        "Seconds remaining on the current rolling interactive lease"
+    );
+    describe_counter!(
+        "llmux_pending_request_cancellations_total",
+        "Pending requests removed after client cancellation"
+    );
+    describe_counter!(
+        "llmux_background_wait_timeouts_total",
+        "Background requests that exhausted their maximum queue wait"
+    );
+    describe_counter!(
+        "llmux_reconciliation_total",
+        "Startup reconciliation outcomes"
+    );
+    describe_gauge!(
+        "llmux_lifecycle_state_info",
+        "One for the current lifecycle state, zero otherwise"
     );
 
     // -- Standard observability metrics (RED) --

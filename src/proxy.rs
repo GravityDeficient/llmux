@@ -45,7 +45,7 @@ pub async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) 
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Proxy error");
-                error_response(StatusCode::BAD_GATEWAY, &format!("Backend error: {}", e))
+                error_response(StatusCode::BAD_GATEWAY, &format!("Backend error: {e}"))
             }
         },
         None => error_response(StatusCode::NOT_FOUND, "No model specified in request"),
@@ -64,7 +64,7 @@ async fn forward(
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    let uri: Uri = format!("http://127.0.0.1:{}{}", port, path_and_query)
+    let uri: Uri = format!("http://127.0.0.1:{port}{path_and_query}")
         .parse()
         .expect("valid proxy URI");
 

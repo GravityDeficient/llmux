@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use llmux::{Config, ModelConfig, PolicyConfig};
+use llmux::{AuthConfig, Config, ModelConfig, OrchestrationConfig, PolicyConfig};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,6 +17,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+
+static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_state_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "llmux-{name}-{}-{}.json",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -32,7 +42,7 @@ impl MockHooks {
         Self {
             wake: format!("sleep {}", wake_ms as f64 / 1000.0),
             sleep: format!("sleep {}", sleep_ms as f64 / 1000.0),
-            alive: "true".to_string(),
+            alive: "false".to_string(),
         }
     }
 }
@@ -61,7 +71,7 @@ async fn spawn_mock_backend(port: u16) -> (SocketAddr, Arc<AtomicUsize>) {
         }),
     );
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
@@ -91,6 +101,7 @@ fn test_config(
             wake: hooks_a.wake.clone(),
             sleep: hooks_a.sleep.clone(),
             alive: hooks_a.alive.clone(),
+            metadata: Default::default(),
         },
     );
     models.insert(
@@ -100,6 +111,7 @@ fn test_config(
             wake: hooks_b.wake.clone(),
             sleep: hooks_b.sleep.clone(),
             alive: hooks_b.alive.clone(),
+            metadata: Default::default(),
         },
     );
 
@@ -111,20 +123,39 @@ fn test_config(
             min_active_secs: 0,
         },
         port: 0,
+        bind_address: "127.0.0.1".to_string(),
+        auth: AuthConfig::default(),
+        orchestration: OrchestrationConfig::default(),
     }
 }
 
 /// Send a chat completion request through the app and return the response body.
 async fn chat_request(app: &Router, model: &str) -> (StatusCode, Value) {
+    chat_request_with(app, model, None, None).await
+}
+
+async fn chat_request_with(
+    app: &Router,
+    model: &str,
+    priority: Option<&str>,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
     let body = json!({
         "model": model,
         "messages": [{"role": "user", "content": "hi"}]
     });
 
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if let Some(priority) = priority {
+        builder = builder.header("X-LLMux-Priority", priority);
+    }
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let req = builder
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap();
 
@@ -135,6 +166,34 @@ async fn chat_request(app: &Router, model: &str) -> (StatusCode, Value) {
         .unwrap_or(json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()}));
 
     (status, json)
+}
+
+async fn control_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    model: Option<&str>,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    if model.is_some() {
+        builder = builder.header("Content-Type", "application/json");
+    }
+    let body = model
+        .map(|model| Body::from(json!({"model": model}).to_string()))
+        .unwrap_or_else(Body::empty);
+    let response = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    (status, value)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -246,8 +305,7 @@ async fn test_switch_timing() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         cold_start >= Duration::from_millis(80),
-        "cold start took {:?}",
-        cold_start
+        "cold start took {cold_start:?}"
     );
 
     // Second request: switch a→b (sleep a ~50ms + wake b ~100ms = ~150ms)
@@ -257,8 +315,7 @@ async fn test_switch_timing() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         switch_time >= Duration::from_millis(120),
-        "switch took {:?}, expected >= 120ms (sleep + wake)",
-        switch_time
+        "switch took {switch_time:?}, expected >= 120ms (sleep + wake)"
     );
 }
 
@@ -321,8 +378,7 @@ async fn test_concurrent_different_models() {
     // All should succeed (FIFO will switch back and forth)
     assert!(
         statuses.iter().all(|s| *s == StatusCode::OK),
-        "Some requests failed: {:?}",
-        statuses
+        "Some requests failed: {statuses:?}"
     );
 
     let total = counter_a.load(Ordering::SeqCst) + counter_b.load(Ordering::SeqCst);
@@ -393,8 +449,7 @@ async fn test_switch_cost_tracking() {
     assert!(cold_a.is_some(), "cold start cost for model-a not recorded");
     assert!(
         cold_a.unwrap() >= Duration::from_millis(30),
-        "cold start cost {:?} too low",
-        cold_a
+        "cold start cost {cold_a:?} too low"
     );
 
     // Switch a → b
@@ -406,8 +461,7 @@ async fn test_switch_cost_tracking() {
     assert!(a_to_b.is_some(), "a→b switch cost not recorded");
     assert!(
         a_to_b.unwrap() >= Duration::from_millis(70),
-        "a→b cost {:?} too low",
-        a_to_b
+        "a→b cost {a_to_b:?} too low"
     );
 
     // b→a not yet observed
@@ -428,8 +482,236 @@ async fn test_switch_cost_tracking() {
     // Directional: a→b should cost more than b→a (80ms wake vs 50ms wake)
     assert!(
         a_to_b.unwrap() > b_to_a.unwrap(),
-        "expected a→b ({:?}) > b→a ({:?}) due to asymmetric wake times",
-        a_to_b,
-        b_to_a
+        "expected a→b ({a_to_b:?}) > b→a ({b_to_a:?}) due to asymmetric wake times"
+    );
+}
+
+#[tokio::test]
+async fn inference_auth_runs_before_lifecycle_switching() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let mut config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    config.auth.inference_bearer_token = Some("inference-secret".into());
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+
+    let (status, _) = chat_request(&app, "model-a").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(switcher.active_model().await, None);
+
+    let (status, _) = chat_request_with(&app, "model-a", None, Some("inference-secret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-a"));
+}
+
+#[tokio::test]
+async fn control_auth_pin_switch_and_unpin() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let mut config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    config.auth.control_bearer_token = Some("control-secret".into());
+    let (app, _) = llmux::build_app(config).await.unwrap();
+
+    let (status, _) = control_request(&app, "POST", "/control/v1/pin", Some("model-a"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = control_request(
+        &app,
+        "POST",
+        "/control/v1/pin",
+        Some("model-a"),
+        Some("control-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pinned_model"], "model-a");
+
+    let (status, body) = control_request(
+        &app,
+        "POST",
+        "/control/v1/switch",
+        Some("model-b"),
+        Some("control-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["active_model"], "model-b");
+    assert_eq!(body["pinned_model"], "model-b");
+
+    let (status, body) = control_request(
+        &app,
+        "DELETE",
+        "/control/v1/pin",
+        None,
+        Some("control-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["pinned_model"].is_null());
+}
+
+#[tokio::test]
+async fn background_waits_for_interactive_lease_but_interactive_overrides() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let mut config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    config.orchestration.interactive_lease_secs = 1;
+    config.orchestration.background_max_wait_secs = 5;
+    let (app, _) = llmux::build_app(config).await.unwrap();
+
+    assert_eq!(chat_request(&app, "model-a").await.0, StatusCode::OK);
+    let background_app = app.clone();
+    let background = tokio::spawn(async move {
+        chat_request_with(&background_app, "model-b", Some("background"), None).await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !background.is_finished(),
+        "background request ignored active lease"
+    );
+    let (status, _) = background.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+
+    // A fresh interactive completion renews model-b's lease, but another
+    // interactive request is allowed to preempt it immediately.
+    let started = Instant::now();
+    assert_eq!(chat_request(&app, "model-a").await.0, StatusCode::OK);
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn background_timeout_is_retryable_and_queue_is_cleaned() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let mut config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    config.orchestration.interactive_lease_secs = 60;
+    config.orchestration.background_max_wait_secs = 0;
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+    assert_eq!(chat_request(&app, "model-a").await.0, StatusCode::OK);
+
+    let body = json!({"model": "model-b", "messages": []});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("X-LLMux-Priority", "background")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "30");
+    let status = switcher.controller_status().await;
+    assert_eq!(status.queues["model-b"].background, 0);
+}
+
+#[tokio::test]
+async fn sleep_failure_is_fail_closed() {
+    let mut hooks_a = MockHooks::new(0, 0);
+    hooks_a.sleep = "false".into();
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+    assert_eq!(chat_request(&app, "model-a").await.0, StatusCode::OK);
+    assert_eq!(
+        chat_request(&app, "model-b").await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-a"));
+}
+
+#[tokio::test]
+async fn wake_failure_restores_previous_model() {
+    let hooks_a = MockHooks::new(0, 0);
+    let mut hooks_b = MockHooks::new(0, 0);
+    hooks_b.wake = "false".into();
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+    assert_eq!(chat_request(&app, "model-a").await.0, StatusCode::OK);
+    assert_eq!(
+        chat_request(&app, "model-b").await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-a"));
+}
+
+#[tokio::test]
+async fn startup_reconciliation_rejects_multiple_active_models() {
+    let mut hooks_a = MockHooks::new(0, 0);
+    let mut hooks_b = MockHooks::new(0, 0);
+    hooks_a.alive = "true".into();
+    hooks_b.alive = "true".into();
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    assert!(llmux::build_app(config).await.is_err());
+}
+
+#[tokio::test]
+async fn pin_persists_and_is_restored_on_restart() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let mut config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let state_path = temp_state_path("pin");
+    config.orchestration.state_path = Some(state_path.clone());
+
+    let (app, _) = llmux::build_app(config.clone()).await.unwrap();
+    assert_eq!(
+        control_request(&app, "POST", "/control/v1/pin", Some("model-a"), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(persisted["pinned_model"], "model-a");
+
+    let (_restarted_app, restarted) = llmux::build_app(config).await.unwrap();
+    let status = restarted.controller_status().await;
+    assert_eq!(status.pinned_model.as_deref(), Some("model-a"));
+    assert_eq!(status.active_model.as_deref(), Some("model-a"));
+    std::fs::remove_file(state_path).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_waiter_is_removed_from_priority_queue() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+    assert_eq!(
+        control_request(&app, "POST", "/control/v1/pin", Some("model-a"), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let queued_app = app.clone();
+    let waiter = tokio::spawn(async move {
+        chat_request_with(&queued_app, "model-b", Some("background"), None).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        switcher.controller_status().await.queues["model-b"].background,
+        1
+    );
+    waiter.abort();
+    let _ = waiter.await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        switcher.controller_status().await.queues["model-b"].background,
+        0
     );
 }

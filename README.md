@@ -1,7 +1,7 @@
 # llmux
 
 [![Crates.io](https://img.shields.io/crates/v/llmux)](https://crates.io/crates/llmux)
-[![GitHub](https://img.shields.io/badge/GitHub-doublewordai%2Fllmux-blue)](https://github.com/doublewordai/llmux)
+[![GitHub](https://img.shields.io/badge/GitHub-GravityDeficient%2Fllmux-blue)](https://github.com/GravityDeficient/llmux)
 
 LLM multiplexer. Routes OpenAI-compatible requests to model backends and
 switches between them on demand using user-provided scripts.
@@ -40,7 +40,18 @@ models:
     sleep: ./scripts/sleep-mistral.sh
     alive: curl -sf http://localhost:8002/health
 
-port: 3000
+bind_address: 127.0.0.1
+port: 18080
+
+auth:
+  # `env:NAME` resolves the secret without placing it in this file.
+  inference_bearer_token: env:LLMUX_INFERENCE_TOKEN
+  control_bearer_token: env:LLMUX_CONTROL_TOKEN
+
+orchestration:
+  interactive_lease_secs: 600
+  background_max_wait_secs: 1800
+  state_path: /var/lib/llmux/state.json
 ```
 
 Run it:
@@ -52,7 +63,8 @@ llmux -c config.yaml
 Send requests:
 
 ```sh
-curl http://localhost:3000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMUX_INFERENCE_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model": "llama", "messages": [{"role": "user", "content": "Hi"}]}'
 ```
@@ -107,10 +119,80 @@ models:
     alive: |
       # Health check. Exit 0 = healthy, non-zero = unhealthy.
       curl -sf http://localhost:8001/health
+    metadata:
+      description: Qwen interactive model
+      topology: tp1
+      context_length: 262144
+      quantization: nvfp4
+      speculative_decoding: mtp-3
+      impact: []
 ```
 
 Hooks are executed via `sh -c` with `LLMUX_MODEL` set in the environment.
 They can be inline scripts (YAML `|` syntax) or paths to executables.
+`metadata` is optional and is returned verbatim as typed operator-facing data
+by the control API; it does not change scheduling.
+
+### Authentication
+
+Inference and control routes have independent optional bearer tokens. Tokens
+may be literal strings or `env:VARIABLE_NAME` references. When inference auth
+is configured, authentication occurs before the request body is inspected, so
+an unauthorized request cannot start or stop a model. `/metrics` intentionally
+remains unauthenticated for a loopback Prometheus scrape.
+
+### Leases, priority, and pins
+
+Every completed interactive response renews a rolling lease for its model
+(10 minutes by default). An interactive request for another model preempts an
+unpinned lease immediately. A background request for another model waits until
+the lease expires and the active model drains; after
+`background_max_wait_secs` it receives `503 Service Unavailable` with
+`Retry-After: 30`.
+
+Traffic is interactive unless the trusted front proxy sets:
+
+```http
+X-LLMux-Priority: background
+```
+
+The header is removed before proxying to the model backend. Do not expose
+llmux directly to untrusted clients when priority enforcement matters; have
+the front proxy overwrite the header.
+
+A pin prevents all inference-triggered switches. It persists when
+`orchestration.state_path` is configured. An authenticated control-plane
+switch moves an existing pin to the selected model; unpinning allows queued
+work to resume.
+
+### Control API
+
+All model-changing bodies have the form `{"model":"<configured-id>"}`:
+
+```text
+GET    /control/v1/state
+POST   /control/v1/switch
+POST   /control/v1/pin
+DELETE /control/v1/pin
+```
+
+Example:
+
+```sh
+curl -fsS http://127.0.0.1:18080/control/v1/pin \
+  -H "Authorization: Bearer $LLMUX_CONTROL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b"}'
+```
+
+The state response contains flat `state`, `active_model`, `target_model`,
+`pinned`, `pinned_model`, lease deadline/countdown, per-model `queues` and
+`in_flight` maps, `last_switch`, `last_error`, and a flattened model catalog.
+
+At startup llmux runs every `alive` hook. Zero healthy models reconciles to
+idle, one becomes active, and more than one aborts startup. A persisted pin is
+then restored. A failed sleep is fail-closed: the target is never woken. A
+failed wake is cleaned up and the previous model is restored when possible.
 
 ### Policy
 
@@ -142,10 +224,53 @@ policy:
   drain_before_switch: <bool>          # default: true
   min_active_secs: <u64>               # default: 0
 
-port: <u16>  # Proxy listen port (default: 3000)
+auth:
+  inference_bearer_token: <string | env:NAME | null>
+  control_bearer_token: <string | env:NAME | null>
+
+orchestration:
+  interactive_lease_secs: <u64>        # default: 600
+  background_max_wait_secs: <u64>      # default: 1800
+  state_path: <path | null>             # configure for persistent pins
+
+bind_address: <string>                  # default: 0.0.0.0
+port: <u16>                             # default: 3000
 ```
 
 Both YAML and JSON configs are supported (detected by file extension).
+
+## Metrics
+
+Prometheus metrics are available at `/metrics` on the same listener. The
+controller-specific series are:
+
+- `llmux_active_model_info{model}`
+- `llmux_pin_info{model}`
+- `llmux_lease_remaining_seconds`
+- `llmux_request_queue_depth{model,priority}`
+- `llmux_pending_request_cancellations_total`
+- `llmux_background_wait_timeouts_total`
+- `llmux_reconciliation_total{result}`
+- `llmux_lifecycle_state_info{state}`
+
+Existing switch, drain, hook, request, queue-wait, and in-flight series remain
+available. Request counters and duration histograms now include a `priority`
+label.
+
+## Container
+
+The production image is multi-architecture (`linux/amd64` and `linux/arm64`),
+runs as UID/GID 65532, and includes `curl` and CA certificates for hooks. Mount
+the config read-only and a writable state directory, then use host networking
+when hooks address host-local lifecycle services:
+
+```sh
+docker run --rm --network host \
+  -e LLMUX_INFERENCE_TOKEN -e LLMUX_CONTROL_TOKEN \
+  -v ./config.yaml:/etc/llmux/config.yaml:ro \
+  -v llmux-state:/var/lib/llmux \
+  ghcr.io/gravitydeficient/llmux:latest
+```
 
 ## Examples
 

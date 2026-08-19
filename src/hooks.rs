@@ -48,6 +48,10 @@ impl HookRunner {
         self.configs.get(model).map(|c| c.port)
     }
 
+    pub fn model_config(&self, model: &str) -> Option<&ModelConfig> {
+        self.configs.get(model)
+    }
+
     pub fn is_registered(&self, model: &str) -> bool {
         self.configs.contains_key(model)
     }

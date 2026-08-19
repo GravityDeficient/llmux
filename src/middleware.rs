@@ -4,6 +4,7 @@
 //! (triggering a switch if needed), acquires an in-flight guard, and wraps
 //! the response body so the guard is held until streaming completes.
 
+use crate::RequestPriority;
 use crate::proxy::ProxyTarget;
 use crate::switcher::{InFlightGuard, ModelSwitcher};
 use crate::types::SwitchError;
@@ -68,7 +69,25 @@ where
 
         Box::pin(async move {
             let request_start = Instant::now();
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
+
+            let priority = match parts
+                .headers
+                .get("x-llmux-priority")
+                .and_then(|value| value.to_str().ok())
+            {
+                None | Some("interactive") => RequestPriority::Interactive,
+                Some("background") => RequestPriority::Background,
+                Some(_) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "X-LLMux-Priority must be interactive or background",
+                    ));
+                }
+            };
+            // This header is control metadata set by the trusted front proxy;
+            // do not disclose it to model backends.
+            parts.headers.remove("x-llmux-priority");
 
             // Collect body bytes so we can inspect the model field
             let body_bytes = match body.collect().await {
@@ -95,10 +114,10 @@ where
 
             if !switcher.is_registered(&model) {
                 warn!(model = %model, "Model not registered");
-                record_request_metrics(&model, 404, request_start);
+                record_request_metrics(&model, priority, 404, request_start);
                 return Ok(error_response(
                     StatusCode::NOT_FOUND,
-                    &format!("Model not found: {}", model),
+                    &format!("Model not found: {model}"),
                 ));
             }
 
@@ -107,17 +126,22 @@ where
             // guard acquisition, loop back so the request waits for the next
             // switch instead of getting a 503.
             let guard = loop {
-                let settle = match switcher.ensure_model_ready(&model).await {
+                let settle = match switcher.ensure_model_ready(&model, priority).await {
                     Ok(settle) => settle,
                     Err(e) => {
                         error!(model = %model, error = %e, "Failed to ensure model ready");
                         let resp = switch_error_response(e);
-                        record_request_metrics(&model, resp.status().as_u16(), request_start);
+                        record_request_metrics(
+                            &model,
+                            priority,
+                            resp.status().as_u16(),
+                            request_start,
+                        );
                         return Ok(resp);
                     }
                 };
 
-                match switcher.acquire_in_flight(&model) {
+                match switcher.acquire_in_flight(&model, priority) {
                     Some(guard) => {
                         // Signal that we've acquired the guard. This unblocks
                         // notify_pending (which holds the switch lock) so the
@@ -143,7 +167,6 @@ where
 
             // Set proxy target so the proxy handler knows where to forward
             let port = switcher.model_port(&model).unwrap();
-            let mut parts = parts;
             parts.extensions.insert(ProxyTarget { port });
 
             let req = Request::from_parts(parts, Body::from(body_bytes));
@@ -154,7 +177,7 @@ where
             let response = inner.call(req).await?;
             let (resp_parts, body) = response.into_parts();
 
-            record_request_metrics(&model, resp_parts.status.as_u16(), request_start);
+            record_request_metrics(&model, priority, resp_parts.status.as_u16(), request_start);
 
             let guarded = GuardedBody {
                 inner: body,
@@ -165,17 +188,19 @@ where
     }
 }
 
-fn record_request_metrics(model: &str, status: u16, start: Instant) {
+fn record_request_metrics(model: &str, priority: RequestPriority, status: u16, start: Instant) {
     let status_str = status.to_string();
     metrics::counter!(
         "llmux_requests_total",
         "model" => model.to_owned(),
+        "priority" => priority.as_str(),
         "status" => status_str.clone()
     )
     .increment(1);
     metrics::histogram!(
         "llmux_request_duration_seconds",
         "model" => model.to_owned(),
+        "priority" => priority.as_str(),
         "status" => status_str
     )
     .record(start.elapsed().as_secs_f64());
@@ -208,27 +233,39 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
 }
 
 fn switch_error_response(error: SwitchError) -> Response<Body> {
+    let retryable = matches!(error, SwitchError::BackgroundTimeout);
     let (status, message) = match &error {
-        SwitchError::ModelNotFound(m) => (StatusCode::NOT_FOUND, format!("Model not found: {}", m)),
+        SwitchError::ModelNotFound(m) => (StatusCode::NOT_FOUND, format!("Model not found: {m}")),
         SwitchError::NotReady(m) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("Model not ready: {}", m),
+            format!("Model not ready: {m}"),
         ),
         SwitchError::Timeout => (
             StatusCode::GATEWAY_TIMEOUT,
             "Request timed out waiting for model".to_string(),
         ),
+        SwitchError::BackgroundTimeout => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Background request timed out waiting for model; retry later".to_string(),
+        ),
+        SwitchError::Pinned(model) => (StatusCode::CONFLICT, format!("Model is pinned: {model}")),
         SwitchError::HookFailed { model, detail } => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Hook failed for {}: {}", model, detail),
+            format!("Hook failed for {model}: {detail}"),
         ),
         SwitchError::Internal(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Internal error: {}", e),
+            format!("Internal error: {e}"),
         ),
     };
 
-    error_response(status, &message)
+    let mut response = error_response(status, &message);
+    if retryable {
+        response
+            .headers_mut()
+            .insert("retry-after", "30".parse().unwrap());
+    }
+    response
 }
 
 /// Response body wrapper that holds an [`InFlightGuard`] until the body is

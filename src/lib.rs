@@ -37,7 +37,9 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
+mod auth;
 mod config;
+mod controller;
 mod cost;
 mod hooks;
 mod middleware;
@@ -47,16 +49,19 @@ mod switcher;
 mod telemetry;
 pub(crate) mod types;
 
-pub use config::{Config, ModelConfig, PolicyConfig};
+pub use config::{
+    AuthConfig, Config, ModelConfig, ModelMetadata, OrchestrationConfig, PolicyConfig,
+};
 pub use cost::SwitchCostTracker;
 pub use hooks::HookRunner;
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use policy::{FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy};
 pub use proxy::{ProxyState, proxy_handler};
 pub use switcher::{InFlightGuard, ModelSwitcher};
-pub use types::{SwitchError, SwitcherState};
+pub use types::{RequestPriority, SwitchError, SwitcherState};
 
 use anyhow::Result;
+use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use axum::{Json, Router};
 use std::sync::Arc;
@@ -70,18 +75,21 @@ use tracing::info;
 pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     info!("Building llmux with {} models", config.models.len());
 
+    // Install before reconciliation so startup hook metrics are captured.
+    let metrics_handle = telemetry::install();
+
     let hooks = Arc::new(HookRunner::new(config.models.clone()));
     let policy = config.policy.build_policy();
-    let switcher = ModelSwitcher::new(hooks, policy);
+    let switcher = ModelSwitcher::new_with_config(hooks, policy, config.orchestration.clone());
+    switcher.reconcile_startup().await?;
+    switcher.restore_pinned_model().await?;
 
     // Spawn background scheduler if the policy uses one
     let _scheduler_handle = switcher.clone().spawn_scheduler();
+    let _orchestration_handle = switcher.clone().spawn_orchestration_scheduler();
 
     // Build proxy
     let proxy_state = ProxyState::new();
-
-    // Install Prometheus metrics recorder (may fail in tests; that's fine)
-    let metrics_handle = telemetry::install();
 
     // Pre-compute /v1/models response from config
     let models_response = {
@@ -105,13 +113,33 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     };
 
     // Main app: proxy with model switcher middleware
-    let mut app = Router::new().route(
-        "/v1/models",
-        get(move || {
-            let resp = models_response.clone();
-            async move { Json(resp) }
-        }),
-    );
+    let inference_token = config.auth.resolve_inference_token()?;
+    let control_token = config.auth.resolve_control_token()?;
+
+    let inference = Router::new()
+        .route(
+            "/v1/models",
+            get(move || {
+                let resp = models_response.clone();
+                async move { Json(resp) }
+            }),
+        )
+        .fallback(proxy_handler)
+        .with_state(proxy_state)
+        .layer(ModelSwitcherLayer::new(switcher.clone()))
+        // Last layer is outermost: reject unauthenticated traffic before the
+        // request body can trigger a lifecycle transition.
+        .layer(from_fn_with_state(
+            auth::BearerAuth(inference_token),
+            auth::require_bearer,
+        ));
+
+    let control = controller::router(switcher.clone()).layer(from_fn_with_state(
+        auth::BearerAuth(control_token),
+        auth::require_bearer,
+    ));
+
+    let mut app = Router::new().merge(inference).merge(control);
 
     if let Some(handle) = metrics_handle {
         app = app.route(
@@ -130,11 +158,6 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
             }),
         );
     }
-
-    let app = app
-        .fallback(proxy_handler)
-        .with_state(proxy_state)
-        .layer(ModelSwitcherLayer::new(switcher.clone()));
 
     Ok((app, switcher))
 }

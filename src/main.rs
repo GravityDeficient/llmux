@@ -23,6 +23,10 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
+    /// Address to bind (overrides config)
+    #[arg(long)]
+    bind_address: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -52,9 +56,13 @@ async fn main() -> Result<()> {
     if let Some(port) = args.port {
         config.port = port;
     }
+    if let Some(bind_address) = args.bind_address {
+        config.bind_address = bind_address;
+    }
 
     info!(
         models = ?config.models.keys().collect::<Vec<_>>(),
+        bind_address = %config.bind_address,
         port = config.port,
         "Configuration loaded"
     );
@@ -63,10 +71,10 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to build application")?;
 
-    let addr = format!("0.0.0.0:{}", config.port);
+    let addr = format!("{}:{}", config.bind_address, config.port);
     let listener = TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+        .with_context(|| format!("Failed to bind to {addr}"))?;
 
     info!(addr = %addr, "Listening for requests");
 
