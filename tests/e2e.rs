@@ -97,6 +97,7 @@ fn test_config(
     models.insert(
         "model-a".to_string(),
         ModelConfig {
+            host: "127.0.0.1".into(),
             port: model_a_port,
             wake: hooks_a.wake.clone(),
             sleep: hooks_a.sleep.clone(),
@@ -107,6 +108,7 @@ fn test_config(
     models.insert(
         "model-b".to_string(),
         ModelConfig {
+            host: "127.0.0.1".into(),
             port: model_b_port,
             wake: hooks_b.wake.clone(),
             sleep: hooks_b.sleep.clone(),
@@ -741,4 +743,215 @@ async fn cancelled_waiter_is_removed_from_priority_queue() {
         switcher.controller_status().await.queues["model-b"].background,
         0
     );
+}
+
+fn manual_config(a: u16, b: u16, hooks_a: &MockHooks, hooks_b: &MockHooks) -> Config {
+    let mut config = test_config(a, b, hooks_a, hooks_b);
+    config.orchestration.manual = true;
+    config.orchestration.active_alias = Some("selected".into());
+    config
+}
+
+#[tokio::test]
+async fn manual_adopts_running_model_and_alias_without_waking_anything() {
+    let (addr, _) = spawn_mock_backend(0).await;
+    let hooks_a = MockHooks {
+        alive: "true".into(),
+        wake: "exit 42".into(),
+        sleep: "exit 42".into(),
+    };
+    let hooks_b = MockHooks {
+        alive: "false".into(),
+        wake: "exit 42".into(),
+        sleep: "exit 42".into(),
+    };
+    let (app, switcher) = llmux::build_app(manual_config(addr.port(), 1, &hooks_a, &hooks_b))
+        .await
+        .unwrap();
+    let (status, body) = chat_request(&app, "selected").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["model"], "model-a");
+    let started = Instant::now();
+    assert_eq!(
+        chat_request(&app, "model-b").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-a"));
+    assert!(switcher.controller_status().await.last_error.is_none());
+}
+
+#[tokio::test]
+async fn manual_restart_does_not_load_saved_choice() {
+    let hooks = MockHooks::new(0, 0);
+    let mut config = manual_config(1, 2, &hooks, &hooks);
+    let path = temp_state_path("manual");
+    std::fs::write(&path, r#"{"pinned_model":"model-a"}"#).unwrap();
+    config.orchestration.state_path = Some(path.clone());
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+    assert!(switcher.active_model().await.is_none());
+    assert_eq!(
+        chat_request(&app, "selected").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn manual_switch_drains_and_serializes_actions() {
+    let mut hooks_a = MockHooks::new(0, 0);
+    hooks_a.alive = "true".into();
+    let hooks_b = MockHooks::new(0, 0);
+    let (app, switcher) = llmux::build_app(manual_config(1, 2, &hooks_a, &hooks_b))
+        .await
+        .unwrap();
+    let guard = switcher
+        .acquire_in_flight("model-a", llmux::RequestPriority::Interactive)
+        .unwrap();
+    let task_switcher = switcher.clone();
+    let action =
+        tokio::spawn(async move { task_switcher.manual_transition(Some("model-b")).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while switcher.controller_status().await.phase.as_deref() != Some("draining") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!action.is_finished());
+    assert_eq!(
+        chat_request(&app, "model-a").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(switcher.manual_transition(None).await.is_err());
+    drop(guard);
+    action.await.unwrap().unwrap();
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-b"));
+    switcher.manual_transition(None).await.unwrap();
+    assert!(switcher.active_model().await.is_none());
+    assert_eq!(
+        chat_request(&app, "model-b").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn manual_drain_timeout_leaves_current_model_running() {
+    let mut hooks = MockHooks::new(0, 0);
+    hooks.alive = "true".into();
+    hooks.sleep = "exit 42".into();
+    let other = MockHooks::new(0, 0);
+    let mut config = manual_config(1, 2, &hooks, &other);
+    config.orchestration.drain_timeout_secs = 0;
+    let (_, switcher) = llmux::build_app(config).await.unwrap();
+    let _guard = switcher
+        .acquire_in_flight("model-a", llmux::RequestPriority::Interactive)
+        .unwrap();
+    assert!(matches!(
+        switcher.manual_transition(Some("model-b")).await,
+        Err(llmux::SwitchError::Timeout)
+    ));
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-a"));
+    assert!(
+        switcher
+            .acquire_in_flight("model-a", llmux::RequestPriority::Interactive)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn manual_failed_stop_never_wakes_another_model() {
+    let marker = temp_state_path("must-not-wake");
+    let hooks_a = MockHooks {
+        alive: "true".into(),
+        wake: "true".into(),
+        sleep: "exit 42".into(),
+    };
+    let hooks_b = MockHooks {
+        alive: "false".into(),
+        wake: format!("touch {}", marker.display()),
+        sleep: "true".into(),
+    };
+    let (_, switcher) = llmux::build_app(manual_config(1, 2, &hooks_a, &hooks_b))
+        .await
+        .unwrap();
+    assert!(switcher.manual_transition(Some("model-b")).await.is_err());
+    assert!(!marker.exists());
+    assert_eq!(switcher.active_model().await.as_deref(), Some("model-a"));
+    assert_eq!(
+        switcher.controller_status().await.phase.as_deref(),
+        Some("failed")
+    );
+    assert!(switcher.manual_transition(Some("model-b")).await.is_err());
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn manual_failed_load_and_cleanup_block_the_next_load() {
+    let marker = temp_state_path("must-not-wake-cleanup");
+    let hooks_a = MockHooks {
+        alive: "false".into(),
+        wake: "exit 42".into(),
+        sleep: "exit 42".into(),
+    };
+    let hooks_b = MockHooks {
+        alive: "false".into(),
+        wake: format!("touch {}", marker.display()),
+        sleep: "true".into(),
+    };
+    let (_, switcher) = llmux::build_app(manual_config(1, 2, &hooks_a, &hooks_b))
+        .await
+        .unwrap();
+    assert!(switcher.manual_transition(Some("model-a")).await.is_err());
+    assert!(switcher.manual_transition(Some("model-b")).await.is_err());
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn manual_stop_requires_control_auth() {
+    let hooks = MockHooks::new(0, 0);
+    let mut config = manual_config(1, 2, &hooks, &hooks);
+    config.auth.control_bearer_token = Some("test-control".into());
+    let (app, _) = llmux::build_app(config).await.unwrap();
+    assert_eq!(
+        control_request(&app, "POST", "/control/v1/stop", None, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        control_request(&app, "POST", "/control/v1/stop", None, Some("test-control"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn proxy_uses_configured_remote_host() {
+    let listener = TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/chat/completions",
+                post(|| async { Json(json!({"remote":true})) }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let hooks_a = MockHooks {
+        alive: "true".into(),
+        wake: "true".into(),
+        sleep: "true".into(),
+    };
+    let hooks_b = MockHooks::new(0, 0);
+    let mut config = manual_config(port, 1, &hooks_a, &hooks_b);
+    config.models.get_mut("model-a").unwrap().host = "127.0.0.2".into();
+    let (app, _) = llmux::build_app(config).await.unwrap();
+    let (status, body) = chat_request(&app, "selected").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["remote"], true);
 }

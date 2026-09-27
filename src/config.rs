@@ -77,6 +77,14 @@ fn resolve_token(value: Option<&str>, field: &str) -> Result<Option<String>> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestrationConfig {
+    /// Only explicit control calls may load or stop a model.
+    #[serde(default)]
+    pub manual: bool,
+    /// Stable request name that follows the operator-selected model.
+    #[serde(default)]
+    pub active_alias: Option<String>,
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
     /// Rolling lease renewed when an interactive response finishes.
     #[serde(default = "default_interactive_lease_secs")]
     pub interactive_lease_secs: u64,
@@ -93,6 +101,9 @@ pub struct OrchestrationConfig {
 impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
+            manual: false,
+            active_alias: None,
+            drain_timeout_secs: default_drain_timeout_secs(),
             interactive_lease_secs: default_interactive_lease_secs(),
             background_max_wait_secs: default_background_max_wait_secs(),
             state_path: None,
@@ -120,6 +131,9 @@ impl Default for OrchestrationConfig {
 /// All hooks are executed via `sh -c` with LLMUX_MODEL set in the environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    /// Backend host, including remote heads on a cluster fabric.
+    #[serde(default = "default_model_host")]
+    pub host: String,
     /// Port where the model's inference server listens
     pub port: u16,
 
@@ -332,4 +346,11 @@ port: 4000
         );
         unsafe { std::env::remove_var("LLMUX_TEST_TOKEN") };
     }
+}
+
+fn default_model_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_drain_timeout_secs() -> u64 {
+    600
 }

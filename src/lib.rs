@@ -75,6 +75,20 @@ use tracing::info;
 pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     info!("Building llmux with {} models", config.models.len());
 
+    // Reject bad configuration before any legacy startup hooks can wake a model.
+    if let Some(alias) = &config.orchestration.active_alias {
+        anyhow::ensure!(
+            !alias.is_empty() && !config.models.contains_key(alias),
+            "active_alias must be nonempty and must not name a configured model"
+        );
+    }
+    for (id, model) in &config.models {
+        let authority = format!("{}:{}", model.host, model.port);
+        authority
+            .parse::<axum::http::uri::Authority>()
+            .map_err(|e| anyhow::anyhow!("invalid backend host for {id}: {e}"))?;
+    }
+
     // Install before reconciliation so startup hook metrics are captured.
     let metrics_handle = telemetry::install();
 
@@ -82,11 +96,15 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     let policy = config.policy.build_policy();
     let switcher = ModelSwitcher::new_with_config(hooks, policy, config.orchestration.clone());
     switcher.reconcile_startup().await?;
-    switcher.restore_pinned_model().await?;
+    if !config.orchestration.manual {
+        switcher.restore_pinned_model().await?;
+    }
 
     // Spawn background scheduler if the policy uses one
-    let _scheduler_handle = switcher.clone().spawn_scheduler();
-    let _orchestration_handle = switcher.clone().spawn_orchestration_scheduler();
+    if !config.orchestration.manual {
+        switcher.clone().spawn_scheduler();
+        switcher.clone().spawn_orchestration_scheduler();
+    }
 
     // Build proxy
     let proxy_state = ProxyState::new();
@@ -105,6 +123,9 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
                 })
             })
             .collect::<Vec<_>>();
+        if let Some(alias) = &config.orchestration.active_alias {
+            data.push(serde_json::json!({"id": alias, "object": "model", "created": 0, "owned_by": "llmux"}));
+        }
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         serde_json::json!({
             "object": "list",

@@ -284,3 +284,42 @@ for setup instructions and timings.
 ## License
 
 MIT
+
+
+## Manual model control
+
+For a dedicated GPU pair, set:
+
+```yaml
+orchestration:
+  manual: true
+  active_alias: spark-active
+  drain_timeout_secs: 600
+  state_path: /var/lib/llmux/state.json
+```
+
+Only authenticated control requests can load or stop models. Inference for an
+inactive model returns 503 immediately. There are no automatic model queues,
+lease switches, startup loads, or fallbacks in this mode. `/control/v1/switch`
+loads the selection; `/control/v1/stop` unloads it. The old pin endpoint remains
+an alias for Load; unpin is rejected. Startup only adopts an already healthy
+model and never wakes a saved selection.
+
+A switch blocks new requests, waits for response streams to finish, stops the
+old model, then loads the selected one. If draining times out, the old model
+stays running. If stop fails, no new model starts. If load fails, cleanup runs;
+failed cleanup must succeed before a later Load can proceed. Lifecycle hooks
+must verify process exit and memory release on all participating hosts.
+
+Status includes `manual` and `phase` (draining, stopping, loading, ready,
+failed, stopped), plus existing request counts and errors. `active_alias`
+rewrites the request's model field to the active model ID before proxying.
+Responses retain the backend's real model ID. Explicit model names keep their
+normal meaning. A per-model `host` selects a remote backend; default is
+`127.0.0.1`.
+
+For an upgrade without stopping inference, run a second manual router on a
+spare loopback port. Lock model controls, move new traffic using a graceful
+reverse-proxy reload, and wait for the old router's requests to finish before
+stopping it. Do not enable model controls while both routers serve requests:
+in-flight counts belong to each process.

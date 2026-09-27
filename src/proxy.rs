@@ -9,9 +9,10 @@ use hyper_util::rt::TokioExecutor;
 use tracing::error;
 
 /// Target port for a proxied request, set by the middleware as a request extension.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ProxyTarget {
     pub port: u16,
+    pub host: String,
 }
 
 /// Shared state for the proxy handler.
@@ -38,10 +39,10 @@ impl ProxyState {
 /// Reads the [`ProxyTarget`] extension (set by the model switcher middleware)
 /// to determine which localhost port to forward to.
 pub async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> Response<Body> {
-    let target = req.extensions().get::<ProxyTarget>().copied();
+    let target = req.extensions().get::<ProxyTarget>().cloned();
 
     match target {
-        Some(ProxyTarget { port }) => match forward(state.client, req, port).await {
+        Some(ProxyTarget { port, host }) => match forward(state.client, req, port, &host).await {
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Proxy error");
@@ -56,6 +57,7 @@ async fn forward(
     client: Client<HttpConnector, Body>,
     mut req: Request<Body>,
     port: u16,
+    host: &str,
 ) -> Result<Response<Body>, hyper_util::client::legacy::Error> {
     // Rewrite URI to target backend
     let path_and_query = req
@@ -64,7 +66,7 @@ async fn forward(
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    let uri: Uri = format!("http://127.0.0.1:{port}{path_and_query}")
+    let uri: Uri = format!("http://{host}:{port}{path_and_query}")
         .parse()
         .expect("valid proxy URI");
 

@@ -24,6 +24,7 @@ struct ModelSelection {
 pub(crate) fn router(switcher: ModelSwitcher) -> Router {
     Router::new()
         .route("/control/v1/state", get(get_state))
+        .route("/control/v1/stop", post(stop_model))
         .route("/control/v1/switch", post(switch_model))
         .route("/control/v1/pin", post(pin_model).delete(unpin_model))
         .with_state(ControlApiState { switcher })
@@ -83,7 +84,9 @@ fn action_response(
         Err(error) => {
             let code = match error {
                 crate::SwitchError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-                crate::SwitchError::Pinned(_) => StatusCode::CONFLICT,
+                crate::SwitchError::Pinned(_) | crate::SwitchError::NotReady(_) => {
+                    StatusCode::CONFLICT
+                }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (
@@ -96,4 +99,10 @@ fn action_response(
                 .into_response()
         }
     }
+}
+
+async fn stop_model(State(state): State<ControlApiState>) -> Response<Body> {
+    let status_switcher = state.switcher.clone();
+    let result = detached_action(async move { state.switcher.manual_transition(None).await }).await;
+    action_response(result, status_switcher.controller_status().await)
 }

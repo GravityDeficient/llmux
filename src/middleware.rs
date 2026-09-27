@@ -90,7 +90,7 @@ where
             parts.headers.remove("x-llmux-priority");
 
             // Collect body bytes so we can inspect the model field
-            let body_bytes = match body.collect().await {
+            let mut body_bytes = match body.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(e) => {
                     error!(error = %e, "Failed to read request body");
@@ -103,13 +103,26 @@ where
 
             let model = extract_model(&body_bytes);
 
-            let Some(model) = model else {
+            let Some(mut model) = model else {
                 // No model specified — pass through (health checks, etc.)
                 trace!("No model in request, passing through");
                 let req = Request::from_parts(parts, Body::from(body_bytes));
                 return inner.call(req).await;
             };
 
+            if switcher.is_active_alias(&model) {
+                let Some(active) = switcher.active_model().await else {
+                    return Ok(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "No model is ready. Select and load a model in Spark Controls.",
+                    ));
+                };
+                model = active;
+                let mut payload: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+                payload["model"] = serde_json::Value::String(model.clone());
+                body_bytes = serde_json::to_vec(&payload).unwrap().into();
+                parts.headers.remove("content-length");
+            }
             debug!(model = %model, "Extracted model from request");
 
             if !switcher.is_registered(&model) {
@@ -167,7 +180,8 @@ where
 
             // Set proxy target so the proxy handler knows where to forward
             let port = switcher.model_port(&model).unwrap();
-            parts.extensions.insert(ProxyTarget { port });
+            let host = switcher.hooks().model_config(&model).unwrap().host.clone();
+            parts.extensions.insert(ProxyTarget { port, host });
 
             let req = Request::from_parts(parts, Body::from(body_bytes));
 

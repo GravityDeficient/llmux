@@ -102,6 +102,7 @@ struct ManagementState {
     lease_model: Option<String>,
     lease_expires_at: Option<SystemTime>,
     last_error: Option<String>,
+    phase: Option<String>,
     last_switch: Option<LastSwitchStatus>,
 }
 
@@ -135,6 +136,8 @@ pub struct LastSwitchStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ControllerStatus {
+    pub manual: bool,
+    pub phase: Option<String>,
     pub state: String,
     pub active_model: Option<String>,
     pub target_model: Option<String>,
@@ -351,6 +354,8 @@ impl ModelSwitcher {
         models.sort_by(|a, b| a.id.cmp(&b.id));
 
         ControllerStatus {
+            manual: self.inner.orchestration.manual,
+            phase: management.phase,
             state: state.to_string(),
             active_model,
             target_model,
@@ -369,6 +374,9 @@ impl ModelSwitcher {
     /// Explicit control-plane switch. If a pin exists, the pin follows the
     /// explicit selection; otherwise the switch remains unpinned.
     pub async fn control_switch(&self, model: &str) -> Result<(), SwitchError> {
+        if self.inner.orchestration.manual {
+            return self.manual_transition(Some(model)).await;
+        }
         self.require_registered(model)?;
         let previous_pin = self
             .inner
@@ -390,6 +398,9 @@ impl ModelSwitcher {
     }
 
     pub async fn pin_model(&self, model: &str) -> Result<(), SwitchError> {
+        if self.inner.orchestration.manual {
+            return self.manual_transition(Some(model)).await;
+        }
         self.require_registered(model)?;
         let previous = self
             .inner
@@ -407,6 +418,11 @@ impl ModelSwitcher {
     }
 
     pub async fn unpin_model(&self) -> Result<(), SwitchError> {
+        if self.inner.orchestration.manual {
+            return Err(SwitchError::NotReady(
+                "Manual mode has no unpin action; use Load or Stop".into(),
+            ));
+        }
         self.set_pin(None).await?;
         self.inner.scheduler_notify.notify_one();
         Ok(())
@@ -608,6 +624,154 @@ impl ModelSwitcher {
         }
     }
 
+    pub fn is_active_alias(&self, name: &str) -> bool {
+        self.inner.orchestration.active_alias.as_deref() == Some(name)
+    }
+
+    fn set_phase(&self, phase: &str) {
+        self.inner.management.lock().expect("management lock").phase = Some(phase.into());
+    }
+
+    /// Explicit, serialized lifecycle for manual mode. Failure never starts
+    /// another model automatically. A failed stop retains ownership so the
+    /// next operator action must retry cleanup before allocating anything.
+    pub async fn manual_transition(&self, target: Option<&str>) -> Result<(), SwitchError> {
+        if !self.inner.orchestration.manual {
+            return Err(SwitchError::NotReady("Stop requires manual mode".into()));
+        }
+        if let Some(model) = target {
+            self.require_registered(model)?;
+        }
+        let _lock = self
+            .inner
+            .switch_lock
+            .try_lock()
+            .map_err(|_| SwitchError::NotReady("A model change is already running".into()))?;
+        let started = Instant::now();
+        let previous = self.active_model().await;
+        if let Some(model) = target {
+            if previous.as_deref() == Some(model)
+                && !self.inner.model_states[model]
+                    .draining
+                    .load(Ordering::SeqCst)
+                && self.inner.hooks.run_alive(model).await.unwrap_or(false)
+            {
+                self.set_phase("ready");
+                self.clear_last_error();
+                return Ok(());
+            }
+        }
+        // Persist intent before doing anything destructive. Manual startup
+        // only observes an existing model; it never wakes this saved choice.
+        self.set_pin(target.map(str::to_owned)).await?;
+        if let Some(model) = &previous {
+            self.inner.model_states[model]
+                .draining
+                .store(true, Ordering::SeqCst);
+        }
+        *self.inner.state.write().await = SwitcherState::Switching {
+            from: previous.clone(),
+            to: target.unwrap_or("").into(),
+        };
+        self.set_phase("draining");
+        if let Some(model) = &previous {
+            let deadline =
+                Instant::now() + Duration::from_secs(self.inner.orchestration.drain_timeout_secs);
+            while self.in_flight_count(model) > 0 {
+                if Instant::now() >= deadline {
+                    self.inner.model_states[model]
+                        .draining
+                        .store(false, Ordering::SeqCst);
+                    *self.inner.state.write().await = SwitcherState::Active {
+                        model: model.clone(),
+                    };
+                    self.set_phase("ready");
+                    self.set_last_error(
+                        "Requests did not finish before the drain deadline; model left running"
+                            .into(),
+                    );
+                    return Err(SwitchError::Timeout);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            self.set_phase("stopping");
+            if let Err(error) = self.inner.hooks.run_sleep(model).await {
+                *self.inner.state.write().await = SwitcherState::Active {
+                    model: model.clone(),
+                };
+                self.set_phase("failed");
+                let detail = format!("Stop failed; no new model was started: {error}");
+                self.set_last_error(detail.clone());
+                self.record_last_switch(
+                    previous.clone(),
+                    target.unwrap_or(""),
+                    "stop_failure",
+                    started.elapsed(),
+                    Some(detail.clone()),
+                );
+                return Err(SwitchError::HookFailed {
+                    model: model.clone(),
+                    detail,
+                });
+            }
+        }
+        if let Some(model) = target {
+            self.set_phase("loading");
+            if let Err(error) = self.inner.hooks.run_wake(model).await {
+                let cleanup = self.inner.hooks.run_sleep(model).await;
+                // A failed cleanup must remain a barrier to the next load.
+                *self.inner.state.write().await = if cleanup.is_err() {
+                    self.inner.model_states[model]
+                        .draining
+                        .store(true, Ordering::SeqCst);
+                    SwitcherState::Active {
+                        model: model.into(),
+                    }
+                } else {
+                    SwitcherState::Idle
+                };
+                self.set_phase("failed");
+                let detail =
+                    format!("Load failed: {error}; cleanup={cleanup:?}. No fallback was started.");
+                self.set_last_error(detail.clone());
+                self.record_last_switch(
+                    previous,
+                    model,
+                    "wake_failure",
+                    started.elapsed(),
+                    Some(detail.clone()),
+                );
+                return Err(SwitchError::HookFailed {
+                    model: model.into(),
+                    detail,
+                });
+            }
+            self.inner.model_states[model]
+                .draining
+                .store(false, Ordering::SeqCst);
+            *self.inner.state.write().await = SwitcherState::Active {
+                model: model.into(),
+            };
+            *self.inner.activated_at.write().await = Some(Instant::now());
+            self.set_phase("ready");
+            self.set_active_metrics(Some(model));
+        } else {
+            *self.inner.state.write().await = SwitcherState::Idle;
+            self.set_phase("stopped");
+            self.set_active_metrics(None);
+        }
+        self.clear_last_error();
+        self.record_last_switch(
+            previous,
+            target.unwrap_or(""),
+            "success",
+            started.elapsed(),
+            None,
+        );
+        self.update_state_metrics().await;
+        Ok(())
+    }
+
     pub fn registered_models(&self) -> Vec<String> {
         self.inner.model_states.keys().cloned().collect()
     }
@@ -688,9 +852,20 @@ impl ModelSwitcher {
             if let SwitcherState::Active { model: active } = &*state
                 && active == model
             {
+                if self.inner.orchestration.manual && model_state.draining.load(Ordering::SeqCst) {
+                    return Err(SwitchError::NotReady(format!(
+                        "{model}; stopping or failed"
+                    )));
+                }
                 trace!(model = %model, "Model already active");
                 return Ok(None);
             }
+        }
+
+        if self.inner.orchestration.manual {
+            return Err(SwitchError::NotReady(format!(
+                "{model}; use Spark Controls to load it"
+            )));
         }
 
         // Queue the request
@@ -1543,6 +1718,7 @@ mod tests {
         configs.insert(
             "model-a".to_string(),
             ModelConfig {
+                host: "127.0.0.1".into(),
                 port: 8001,
                 wake: "true".to_string(),
                 sleep: "true".to_string(),
@@ -1553,6 +1729,7 @@ mod tests {
         configs.insert(
             "model-b".to_string(),
             ModelConfig {
+                host: "127.0.0.1".into(),
                 port: 8002,
                 wake: "true".to_string(),
                 sleep: "true".to_string(),
